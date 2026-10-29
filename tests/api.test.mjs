@@ -1,0 +1,50 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFile,writeFile,unlink} from 'node:fs/promises';
+import {reset} from './mock-blobs.mjs';
+const origin=new URL('../netlify/functions/api.mjs',import.meta.url);
+const target=new URL('../netlify/functions/api.testing.mjs',import.meta.url);
+let handler;
+async function call(action,body,cookie){const req=new Request('https://school.example/api/'+action,{method:body===undefined?'GET':'POST',headers:{...(body===undefined?{}:{'Content-Type':'application/json'}),...(cookie?{Cookie:cookie}:{})},body:body===undefined?undefined:JSON.stringify(body)});const r=await handler(req);return {status:r.status,data:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]}}
+let teacher,student;
+test('Netlify API via Fake-Blobs: Registrierung, Klassenrechte, Speicherung, Shop, Lehreraktionen',async()=>{
+ reset();process.env.TEACHER_INVITE_CODE='LEHRER-CODE-1234567890';
+ const source=await readFile(origin,'utf8');await writeFile(target,source.replace("from '@netlify/blobs'","from '../../tests/mock-blobs.mjs'"));
+ try{
+  ({default:handler}=await import(target.href+'?test='+Date.now()));
+  const reg=await call('register',{nickname:'ProfiTutor',schoolClass:'FOS12A',password:'einLangesPasswort',role:'teacher',teacherCode:'LEHRER-CODE-1234567890'});
+  assert.equal(reg.status,201);teacher=reg.cookie;
+  const badTeacher=await call('register',{nickname:'Trick',schoolClass:'FOS12A',password:'passwort123',role:'teacher',teacherCode:'falsch'});
+  assert.equal(badTeacher.status,403);
+  const stu=await call('register',{nickname:'TestSchüler',schoolClass:'FOS12A',password:'passwort123',role:'student'});
+  assert.equal(stu.status,201);student=stu.cookie;
+  const second=await call('register',{nickname:'TestSchüler',schoolClass:'FOS12A',password:'passwort123',role:'student'});
+  assert.equal(second.status,409);
+  const separate=await call('register',{nickname:'TestSchüler',schoolClass:'FOS12B',password:'passwort123',role:'student'});assert.equal(separate.status,201);
+  const noRoster=await call('roster',undefined,student);assert.equal(noRoster.status,403);
+  const roster=await call('roster',undefined,teacher);assert.equal(roster.status,200);
+  assert(roster.data.users.some(u=>u.nickname==='TestSchüler'));
+  assert(!roster.data.users.some(u=>u.schoolClass==='FOS12B'));
+  const ans=await call('answer',{id:'lang-03',answer:'16,00'},student);
+  assert.equal(ans.status,200);assert.equal(ans.data.correct,true);
+  assert(ans.data.user.progress.awards['lang-03'].xp>0);
+  const repeated=await call('answer',{id:'lang-03',answer:'16,00'},student);
+  assert.equal(repeated.data.user.progress.awards['lang-03'].xp,ans.data.user.progress.awards['lang-03'].xp);
+  const wrong=await call('answer',{id:'lang-04',answer:999},student);
+  assert.equal(wrong.data.correct,false);
+  const text=await call('answer',{id:'elimination-07',answer:'Der positive Deckungsbeitrag reduziert den Verlust.'},student);
+  assert.equal(text.data.correct,null);
+  const self=await call('answer',{id:'elimination-07',answer:'Der positive Deckungsbeitrag reduziert den Verlust.',selfCheck:'correct'},student);
+  assert.equal(self.data.correct,true);
+  const progressReset=await call('teacher',{mode:'resetProgress',nickname:'TestSchüler'},teacher);
+  assert.equal(progressReset.status,200);
+  const cleared=await call('me',undefined,student);assert.equal(Object.keys(cleared.data.user.progress.answers).length,0);
+  const resetPW=await call('teacher',{mode:'resetPassword',nickname:'TestSchüler'},teacher);
+  assert.equal(resetPW.status,200);assert(resetPW.data.temporaryPassword.length>=12);
+  const oldSession=await call('me',undefined,student);assert.equal(oldSession.data.user,null);
+  const logged=await call('login',{nickname:'TestSchüler',schoolClass:'FOS12A',password:resetPW.data.temporaryPassword,role:'student'});
+  assert.equal(logged.status,200);
+  const removed=await call('teacher',{mode:'remove',nickname:'TestSchüler'},teacher);assert.equal(removed.status,200);
+  const deleted=await call('me',undefined,logged.cookie);assert.equal(deleted.data.user,null);
+ }finally{await unlink(target)}
+});
